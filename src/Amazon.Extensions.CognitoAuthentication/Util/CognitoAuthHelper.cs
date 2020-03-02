@@ -16,6 +16,7 @@
 using System;
 using System.Text;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Security.Cryptography;
 using System.Reflection;
 
@@ -64,6 +65,8 @@ namespace Amazon.Extensions.CognitoAuthentication.Util
 
             return Convert.ToBase64String(hashMessage);
         }
+
+        internal static string UtcNow => DateTime.UtcNow.ToString("ddd MMM d HH:mm:ss \"UTC\" yyyy", CultureInfo.InvariantCulture);
 
         /// <summary>
         /// Creates a byte array which combines all of the byte[] in values in the order of the array

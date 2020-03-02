@@ -182,11 +182,93 @@ namespace Amazon.Extensions.CognitoAuthentication
         /// Allows the user to reset their password using an asynchronous call. Should be used in 
         /// conjunction with the ConfirmPasswordAsync method 
         /// </summary>
-        public Task ForgotPasswordAsync()
+        public async Task<CodeDeliveryDetailsType> ForgotPasswordAsync()
         {
             ForgotPasswordRequest forgotPassRequest = CreateForgotPasswordRequest();
 
-            return Provider.ForgotPasswordAsync(forgotPassRequest);
+            ForgotPasswordResponse response = await Provider.ForgotPasswordAsync(forgotPassRequest).ConfigureAwait(false);
+
+            return response.CodeDeliveryDetails;
+        }
+
+        /// <summary>
+        /// todo add comment
+        /// </summary>
+        /// <param name="sessionToken"></param>
+        /// <returns></returns>
+        public async Task<AssociateSoftwareTokenResponse> AssociateSoftwareTokenAsync(string sessionToken)
+        {
+            EnsureUserAuthenticated();
+
+            AssociateSoftwareTokenRequest request = new AssociateSoftwareTokenRequest
+            {
+                AccessToken = SessionTokens.AccessToken,
+                Session = sessionToken
+            };
+
+            return await Provider.AssociateSoftwareTokenAsync(request).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// Use for confirm software mfa token via authentication.
+        /// </summary>
+        /// <param name="code">Software mfa token from app</param>
+        /// <param name="sessionToken">Not required, may be null. Use in <see cref="VerifySoftwareTokenRequest"/></param>
+        /// <returns></returns>
+        public async Task<bool> VerifySoftwareTokenAsync(string code, string sessionToken = null)
+        {
+            if (string.IsNullOrEmpty(code))
+                throw new ArgumentNullException(nameof(code));
+
+            EnsureUserAuthenticated();
+            VerifySoftwareTokenRequest request = new VerifySoftwareTokenRequest
+            {
+                AccessToken = SessionTokens.AccessToken,
+                FriendlyDeviceName = Device.GetDeviceName() ?? string.Empty,
+                Session = sessionToken,
+                UserCode = code
+            };
+
+            VerifySoftwareTokenResponse response = await Provider.VerifySoftwareTokenAsync(request).ConfigureAwait(false);
+            return response.Status == VerifySoftwareTokenResponseType.SUCCESS;
+        }
+
+        /// <summary>
+        /// Update mfa settings for user.
+        /// </summary>
+        /// <param name="softwareMfaSettings">Item1 - isPreferred, Item2 - isEnabled; null - not send</param>
+        /// <param name="smsMfaSettings">Item1 - isPreferred, Item2 - isEnabled; null - not send</param>
+        /// <returns><see cref="Task"/> for awaiting</returns>
+        public async Task UpdateMfaSettingsAsync(Tuple<bool, bool> softwareMfaSettings, Tuple<bool, bool> smsMfaSettings)
+        {
+            if (softwareMfaSettings == null & smsMfaSettings == null)
+                return;
+
+            EnsureUserAuthenticated();
+            SetUserMFAPreferenceRequest request = new SetUserMFAPreferenceRequest
+            {
+                AccessToken = SessionTokens.AccessToken
+            };
+
+            if (softwareMfaSettings != null)
+            {
+                request.SoftwareTokenMfaSettings = new SoftwareTokenMfaSettingsType
+                {
+                    PreferredMfa = softwareMfaSettings.Item1,
+                    Enabled = softwareMfaSettings.Item2
+                };
+            }
+
+            if (smsMfaSettings != null)
+            {
+                request.SMSMfaSettings = new SMSMfaSettingsType
+                {
+                    PreferredMfa = smsMfaSettings.Item1,
+                    Enabled = smsMfaSettings.Item2
+                };
+            }
+
+            await Provider.SetUserMFAPreferenceAsync(request).ConfigureAwait(false);
         }
 
         /// <summary>
@@ -239,12 +321,15 @@ namespace Amazon.Extensions.CognitoAuthentication
         /// <param name="medium">Name of the attribute the verification code is being sent to.
         /// Should be either email or phone_number.</param>
         /// <returns>Returns the delivery details for the attribute verification code request</returns>
-        public Task GetAttributeVerificationCodeAsync(string medium)
+        public async Task<CodeDeliveryDetailsType> GetAttributeVerificationCodeAsync(string medium)
         {
             GetUserAttributeVerificationCodeRequest getAttributeCodeRequest =
                     CreateGetUserAttributeVerificationCodeRequest(medium);
 
-            return Provider.GetUserAttributeVerificationCodeAsync(getAttributeCodeRequest);
+            GetUserAttributeVerificationCodeResponse response = await Provider
+                .GetUserAttributeVerificationCodeAsync(getAttributeCodeRequest).ConfigureAwait(false);
+
+            return response.CodeDeliveryDetails;
         }
 
         /// <summary>
@@ -296,18 +381,20 @@ namespace Amazon.Extensions.CognitoAuthentication
         /// using an asynchronous call
         /// </summary>
         /// <param name="attributes">The attributes to be updated</param>
-        public async Task UpdateAttributesAsync(IDictionary<string, string> attributes)
+        public async Task<List<CodeDeliveryDetailsType>> UpdateAttributesAsync(IDictionary<string, string> attributes)
         {
             UpdateUserAttributesRequest updateUserAttributesRequest =
                 CreateUpdateUserAttributesRequest(attributes);
 
-            await Provider.UpdateUserAttributesAsync(updateUserAttributesRequest).ConfigureAwait(false);
+            UpdateUserAttributesResponse response = await Provider.UpdateUserAttributesAsync(updateUserAttributesRequest).ConfigureAwait(false);
 
             //Update the local Attributes property
             foreach (KeyValuePair<string, string> entry in attributes)
             {
                 Attributes[entry.Key] = entry.Value;
             }
+
+            return response.CodeDeliveryDetailsList;
         }
 
         /// <summary>
@@ -368,6 +455,72 @@ namespace Amazon.Extensions.CognitoAuthentication
             }
 
             return devicesList;
+        }
+        /// <summary>
+        /// 
+        /// </summary>
+        /// <param name="deviceMetadata"></param>
+        /// <param name="deviceFriendlyName"></param>
+        /// <returns></returns>
+        public async Task ConfirmDeviceAsync(NewDeviceMetadataType deviceMetadata, string deviceFriendlyName)
+        {
+            EnsureUserAuthenticated();
+            if (deviceMetadata == null)
+                throw new ArgumentNullException(nameof(deviceMetadata));
+
+            string deviceKey = deviceMetadata.DeviceKey;
+            string deviceGroupKey = deviceMetadata.DeviceGroupKey;
+
+            IDictionary<string, string> verificationParameters =
+                CognitoDeviceHelper.GenerateVerificationParameters(deviceKey, deviceGroupKey);
+
+            ConfirmDeviceRequest confirmDeviceRequest = new ConfirmDeviceRequest
+            {
+                AccessToken = SessionTokens.AccessToken,
+                DeviceKey = deviceKey,
+                DeviceName = deviceFriendlyName,
+                DeviceSecretVerifierConfig = new DeviceSecretVerifierConfigType
+                {
+                    PasswordVerifier = verificationParameters["verifier"],
+                    Salt = verificationParameters["salt"]
+                }
+            };
+
+            await Provider.ConfirmDeviceAsync(confirmDeviceRequest).ConfigureAwait(false);
+
+            var type = new DeviceType
+            {
+                DeviceKey = deviceKey,
+                DeviceAttributes = new List<AttributeType>()
+            };
+            Device = new CognitoDevice(type, this)
+            {
+                GroupDeviceKey = deviceGroupKey,
+                DeviceSecret = verificationParameters["secret"]
+            };
+        }
+
+        /// <summary>
+        /// Update status for cognito device
+        /// </summary>
+        /// <param name="deviceStatus">The device remembered status for the associated CognitoDevice</param>
+        /// <returns></returns>
+        public async Task<UpdateDeviceStatusResponse> UpdateDeviceStatusAsync(string deviceStatus)
+        {
+            EnsureUserAuthenticated();
+            if (string.IsNullOrWhiteSpace(deviceStatus))
+                throw new ArgumentNullException(nameof(deviceStatus));
+            if (Device == null)
+                throw new Exception($"{Device} is null at {nameof(CognitoUser)}");
+
+            var request = new UpdateDeviceStatusRequest
+            {
+                AccessToken = SessionTokens.AccessToken,
+                DeviceKey = Device.DeviceKey,
+                DeviceRememberedStatus = deviceStatus
+            };
+
+            return await Provider.UpdateDeviceStatusAsync(request).ConfigureAwait(false);
         }
 
         private ConfirmSignUpRequest CreateConfirmSignUpRequest(string confirmationCode, bool forcedAliasCreation)

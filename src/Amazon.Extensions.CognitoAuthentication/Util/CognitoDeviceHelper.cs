@@ -66,6 +66,12 @@ namespace Amazon.Extensions.CognitoAuthentication.Util
 
             Salt = new byte[16];
             random.NextBytes(Salt);
+            //fix negative salt
+            var preBigSalt = new BigInteger(Salt);
+            if (preBigSalt.Sign < 0) {
+                Salt = (-1 * preBigSalt).ToByteArray();
+            }
+
 
             Verifier = CalculateVerifier(Salt, deviceKeyHash);
         }
