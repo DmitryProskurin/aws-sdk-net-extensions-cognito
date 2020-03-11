@@ -96,9 +96,135 @@ while (authResponse.AuthenticationResult == null)
         }
 }
 ```
-
 [Learn more about Amazon Cognito User Pool Authentication Flow.](https://docs.aws.amazon.com/cognito/latest/developerguide/amazon-cognito-user-pools-authentication-flow.html)
 
+## Refresh Token Authentication
+
+Refresh token authentication required device remembering in Cognito User pool. After user pass all form of authentication, last
+respond will contains **NewDeviceMetadataType** in **AuthenticationResult**. That data used to confirm device in Cognito User Pool. **StartWithRefreshTokenAuthAsync** not working without remembered device in Cognito User Pool.
+
+```csharp
+class CognitonAuthentication
+{
+    private readonly AmazonCognitoIdentityProviderClient _provider;
+    private readonly CognitoUserPool _userPool;
+    
+    public CognitonAuthentication()
+    {
+        _provider = new AmazonCognitoIdentityProviderClient(new AnonymousAWSCredentials(),
+            FallbackRegionFactory.GetRegionEndpoint());
+        _userPool = new CognitoUserPool("poolID", "clientID", _provider);
+    }
+
+    public async Task<CognitoUser> SignInWithPasswordAsync(string email, string password)
+    {
+        var user = _userPool.GetUser(email);
+
+        var authFlowResponse = await user.StartWithSrpAuthAsync(new InitiateSrpAuthRequest
+        {
+            Password = password
+        }).ConfigureAwait(false);
+
+        //if user don't has another forms of auth, then authFlowResponse.ChallengeName will be null
+        //and you can confirm device in Cognito like this
+        var deviceMetadata = authFlowResponse.AuthenticationResult.NewDeviceMetadata;
+        await user.ConfirmDeviceAsync(deviceMetadata, "device friendly name").ConfigureAwait(false);
+
+        //now user has valid device object, remembered in Cognito.
+        saveDeviceInfoForUser(user);
+        saveSessionTokensForUser(user);
+        return user;
+    }
+
+    /// <summary>
+    /// Refresh session for user. User must has remembered device and session object
+    /// </summary>
+    public async Task RefreshSessionForUserAsync(CognitoUser user)
+    {
+        await user.StartWithRefreshTokenAuthAsync(
+                new InitiateRefreshTokenAuthRequest {
+                    AuthFlowType = AuthFlowType.REFRESH_TOKEN
+                })
+            .ConfigureAwait(false);
+        saveSessionTokensForUser(user);
+    }
+
+    private void saveDeviceInfoForUser(CognitoUser user)
+    {
+        //save device values(between app sessions) for use in refresh token auth flow after token expired
+        saveDeviceKeyForUser(user,user.Device.DeviceKey);
+        saveDeviceGroupKeyForUser(user, user.Device.GroupDeviceKey);
+        saveDeviceSecretForUser(user, user.Device.DeviceSecret);
+    }
+    
+    private void saveSessionTokensForUser(CognitoUser user)
+    {
+        //save that token values(between app sessions) for use when user launch app again
+        saveAccessTokenForUser(user, user.SessionTokens.AccessToken);
+        saveIdTokenForUser(user, user.SessionTokens.IdToken);
+        saveRefreshTokenForUser(user, user.SessionTokens.RefreshToken);
+        saveIssuedTimeForuser(user, user.SessionTokens.IssuedTime);
+        saveExpirationTimeForUser(user, user.SessionTokens.ExpirationTime);
+    }
+}
+```
+
+Later, after token is expired(check **CognitoUser.SessionTokens.ExpirationTime**) or user don't launch app for long time, you should restore device and session info in **CognitoUser** object and call **RefreshSessionForUserAsync**.
+For example:
+
+```csharp
+class CognitonAuthentication
+{
+    public CognitonAuthentication()
+    {
+        _provider = new AmazonCognitoIdentityProviderClient(new AnonymousAWSCredentials(),
+            FallbackRegionFactory.GetRegionEndpoint());
+        _userPool = new CognitoUserPool("poolID", "clientID", _provider);
+    }
+    
+    //CognitoUser from that method can be used in RefreshSessionForUserAsync for refresh session
+    public CognitoUser RestoreUser(string email) {
+        var user = _userPool.GetUser(email);
+        //restore deviceinfo, otherwise RefreshSessionForUserAsync can't work
+        user = restoreDevice(user);
+        //refresh token is required for refresh session
+        user = restoreSessionTokens(user);
+        return user;
+    }
+
+    private CognitoUser restoreDevice(CognitoUser user)
+    {
+        var device = new CognitoDevice(
+            restoreDeviceKeyForUser(user), new Dictionary<string, string>(),
+            DateTime.Now, DateTime.Now,
+            DateTime.Now, user) {
+            GroupDeviceKey = restoreDeviceGroupKeyForUser(user),
+            DeviceSecret = restoreDeviceSecretForUser(user)
+        };
+        user.Device = device;
+        return user;
+    }
+
+    private CognitoUser restoreSessionTokens(CognitoUser user)
+    {
+        var userSession = new CognitoUserSession(
+            restoreIdTokenForUser(user),
+            restoreSessionTokenForUser(user),
+            restoreRefreshTokenForUser(user),
+            restoreIssuedTimeForUser(user),
+            restoreExpirationTimeForUser(user));
+        user.SessionTokens = userSession;
+        return user;
+    }
+}
+```
+
+Note: modification for device remembering based on AWS sdk for Android. Also, it contains fix for negative salts. **Random** fill array of bytes(on client) and use it for device credentials. Probably, AWS side convert client's byte
+array to BigInteger and fails in check for negative value. I make simple(but not best) solution - look at [CognitoDeviceHelper](https://github.com/DmitryProskurin/aws-sdk-net-extensions-cognito/blob/CognitoUserImprovements/src/Amazon.Extensions.CognitoAuthentication/Util/CognitoDeviceHelper.cs) **GenerateDeviceSaltAndVerifier** method,
+Salt negate. If you wan't improve this solution, that byte array as Salt fails on AWS: 
+```
+new byte[16]{ 0xff, 0x7e, 0x46, 0xac, 0x16, 0x9b, 0x00, 0x91, 0xe1, 0x88, 0xa2, 0x9c, 0x17, 0x80,0x57, 0xab }
+```
 ## Authenticating with Multiple Forms of Authentication
 
 Once a user is authenticated using the Amazon Cognito Authentication Extension Library, you can them allow them to access the specific AWS resources. 

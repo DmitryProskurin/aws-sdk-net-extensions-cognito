@@ -15,8 +15,9 @@
 
 using System;
 using System.Collections.Generic;
-using System.Globalization;
 using System.Numerics;
+using System.Security.Cryptography;
+using System.Text;
 using System.Threading.Tasks;
 using Amazon.CognitoIdentity;
 using Amazon.CognitoIdentityProvider;
@@ -50,16 +51,13 @@ namespace Amazon.Extensions.CognitoAuthentication
             RespondToAuthChallengeRequest challengeRequest =
                 CreateSrpPasswordVerifierAuthRequest(initiateResponse, srpRequest.Password, tupleAa);
 
-            bool challengeResponsesValid = challengeRequest != null && challengeRequest.ChallengeResponses != null;
-            bool deviceKeyValid = Device != null && !string.IsNullOrEmpty(Device.DeviceKey);
-
-            if (challengeResponsesValid && deviceKeyValid)
-            {
-                challengeRequest.ChallengeResponses.Add(CognitoConstants.ChlgParamDeviceKey, Device.DeviceKey);
-            }
-
-            RespondToAuthChallengeResponse verifierResponse =
+            RespondToAuthChallengeResponse verifierResponse = 
                 await Provider.RespondToAuthChallengeAsync(challengeRequest).ConfigureAwait(false);
+
+            if (verifierResponse.ChallengeName == ChallengeNameType.DEVICE_SRP_AUTH)
+            {
+                verifierResponse = await HandleDeviceSrpAuthResponseAsync(verifierResponse, tupleAa).ConfigureAwait(false);
+            }
 
             UpdateSessionIfAuthenticationComplete(verifierResponse.ChallengeName, verifierResponse.AuthenticationResult);
 
@@ -171,6 +169,47 @@ namespace Amazon.Extensions.CognitoAuthentication
             UpdateSessionIfAuthenticationComplete(challengeResponse.ChallengeName, challengeResponse.AuthenticationResult);
 
             return new AuthFlowResponse()
+            {
+                SessionID = challengeResponse.Session,
+                ChallengeName = challengeResponse.ChallengeName,
+                AuthenticationResult = challengeResponse.AuthenticationResult,
+                ChallengeParameters = challengeResponse.ChallengeParameters,
+                ClientMetadata = new Dictionary<string, string>(challengeResponse.ResponseMetadata.Metadata)
+            };
+        }
+
+        public async Task<AuthFlowResponse> RespondToSoftwareMfaAuthAsync(RespondToSoftwareMfaRequest softwareMfaRequest)
+        {
+            RespondToAuthChallengeRequest challengeRequest = new RespondToAuthChallengeRequest
+            {
+                ChallengeResponses = new Dictionary<string, string>
+                {
+                    { CognitoConstants.ChlgParamSoftwareMfaCode, softwareMfaRequest.MfaCode},
+                    { CognitoConstants.ChlgParamUsername, Username },
+                },
+                Session = softwareMfaRequest.SessionID,
+                ClientId = ClientID,
+                ChallengeName = "SOFTWARE_TOKEN_MFA"
+            };
+
+            if (Device != null && !string.IsNullOrEmpty(Device.DeviceKey))
+            {
+                challengeRequest.ChallengeResponses.Add(CognitoConstants.ChlgParamDeviceKey, Device.DeviceKey);
+            }
+
+            if (!string.IsNullOrEmpty(SecretHash))
+            {
+                challengeRequest.ChallengeResponses.Add(CognitoConstants.ChlgParamSecretHash, SecretHash);
+            }
+
+            RespondToAuthChallengeResponse challengeResponse =
+                await Provider.RespondToAuthChallengeAsync(challengeRequest).ConfigureAwait(false);
+
+            if (challengeResponse.ChallengeName == ChallengeNameType.DEVICE_SRP_AUTH)
+                challengeResponse = await HandleDeviceSrpAuthResponseAsync(challengeResponse).ConfigureAwait(false);
+            UpdateSessionIfAuthenticationComplete(challengeResponse.ChallengeName, challengeResponse.AuthenticationResult);
+
+            return new AuthFlowResponse
             {
                 SessionID = challengeResponse.Session,
                 ChallengeName = challengeResponse.ChallengeName,
@@ -431,8 +470,7 @@ namespace Amazon.Extensions.CognitoAuthentication
                 throw new ArgumentException("SRP error, B mod N cannot be zero.", "challenge");
             }
 
-            DateTime timestamp = DateTime.UtcNow;
-            string timeStr = timestamp.ToString("ddd MMM d HH:mm:ss \"UTC\" yyyy", CultureInfo.InvariantCulture);
+            string timeStr = CognitoAuthHelper.UtcNow;
 
             byte[] claim = AuthenticationHelper.AuthenticateUser(username, password, poolName, tupleAa, salt,
                 challenge.ChallengeParameters[CognitoConstants.ChlgParamSrpB], secretBlock, timeStr);
@@ -485,6 +523,111 @@ namespace Amazon.Extensions.CognitoAuthentication
             credentials.AddLogin(providerName, SessionTokens.IdToken);
 
             return credentials;
+        }
+        /// <summary>
+        /// Respond to auth challange with name DEVICE_SRP_AUTH.
+        /// </summary>
+        /// <param name="currentResponse">Current auth response from AWS</param>
+        /// <param name="AaTuple">Use for generate to current auth challange. If null - create new one.</param>
+        /// <returns></returns>
+        private async Task<RespondToAuthChallengeResponse> HandleDeviceSrpAuthResponseAsync(
+            RespondToAuthChallengeResponse currentResponse, Tuple<BigInteger, BigInteger> AaTuple = null)
+        {
+            if (currentResponse == null)
+                throw new ArgumentNullException(nameof(currentResponse));
+
+            if (AaTuple == null)
+                AaTuple = AuthenticationHelper.CreateAaTuple();
+
+            var challengeRequest = new RespondToAuthChallengeRequest
+            {
+                ClientId = ClientID,
+                Session = currentResponse.Session,
+                ChallengeName = ChallengeNameType.DEVICE_SRP_AUTH,
+                ChallengeResponses = new Dictionary<string, string> {
+                    {CognitoConstants.ChlgParamUsername, Username},
+                    {CognitoConstants.ChlgParamSrpA, AaTuple.Item1.ToString("X")},
+                    {CognitoConstants.ChlgParamDeviceKey, Device.DeviceKey},
+                    {CognitoConstants.ChlgParamSecretHash, SecretHash}
+                }
+            };
+            currentResponse =
+                await Provider.RespondToAuthChallengeAsync(challengeRequest).ConfigureAwait(false);
+
+            if (currentResponse.ChallengeName == ChallengeNameType.DEVICE_PASSWORD_VERIFIER)
+            {
+                challengeRequest = CreateDeviceSrpAuthRequest(currentResponse, AaTuple);
+            }
+            else
+            {
+                throw new Exception($"Unsupported challenge {currentResponse.ChallengeName}");
+            }
+
+            return await Provider.RespondToAuthChallengeAsync(challengeRequest).ConfigureAwait(false);
+        }
+        /// <summary>
+        /// Create request for DEVICE_SRP_AUTH.
+        /// </summary>
+        /// <param name="challenge">Current auth challange response</param>
+        /// <param name="AaTuple">Use for generate request</param>
+        /// <returns>DEVICE_SRP_AUTH request</returns>
+        private RespondToAuthChallengeRequest CreateDeviceSrpAuthRequest(RespondToAuthChallengeResponse challenge,
+            Tuple<BigInteger, BigInteger> AaTuple)
+        {
+            var usernameInternal = challenge.ChallengeParameters[CognitoConstants.ChlgParamUsername];
+
+            BigInteger srpB;
+            if (challenge.ChallengeParameters.TryGetValue(CognitoConstants.ChlgParamSrpB, out var srpBBytes))
+                srpB = BigIntegerExtensions.FromHexPositive(srpBBytes);
+            else
+                throw new Exception($"Missing {CognitoConstants.ChlgParamSrpB}");
+
+            if (srpB.TrueMod(AuthenticationHelper.N).IsZero)
+            {
+                throw new Exception("SRP error, B cannot be zero");
+            }
+
+            var salt = BigIntegerExtensions.FromHexPositive(challenge.ChallengeParameters[CognitoConstants.ChlgParamSalt]);
+            var key = AuthenticationHelper.GetPasswordAuthenticationKey(Device.DeviceKey, Device.DeviceSecret, Device.GroupDeviceKey, AaTuple, srpB, salt);
+
+            string hmac;
+            var dateString = CognitoAuthHelper.UtcNow;
+            {
+                var hmacSha256 = new HMACSHA256(key);
+                var bytes = CognitoAuthHelper.CombineBytes(new[] {
+                    Encoding.UTF8.GetBytes(Device.GroupDeviceKey),
+                    Encoding.UTF8.GetBytes(Device.DeviceKey),
+                    Convert.FromBase64String(challenge.ChallengeParameters[CognitoConstants.ChlgParamSecretBlock]),
+                    Encoding.UTF8.GetBytes(dateString)
+                });
+                hmac = Convert.ToBase64String(hmacSha256.ComputeHash(bytes));
+            }
+
+            string secretHash;
+            {
+                var hmacSha256 = new HMACSHA256(Encoding.UTF8.GetBytes(ClientSecret));
+                var hash = hmacSha256.ComputeHash(CognitoAuthHelper.CombineBytes(new[] {
+                    Encoding.UTF8.GetBytes(usernameInternal),
+                    Encoding.UTF8.GetBytes(ClientID),
+                }));
+                secretHash = Convert.ToBase64String(hash);
+            }
+
+            var challengeResponses = new Dictionary<string, string> {
+                {CognitoConstants.ChlgParamPassSecretBlock, challenge.ChallengeParameters[CognitoConstants.ChlgParamSecretBlock]},
+                {CognitoConstants.ChlgParamPassSignature, hmac},
+                {CognitoConstants.ChlgParamTimestamp, dateString},
+                {CognitoConstants.ChlgParamUsername, usernameInternal},
+                {CognitoConstants.ChlgParamDeviceKey, Device.DeviceKey},
+                {CognitoConstants.ChlgParamSecretHash, secretHash}
+            };
+            return new RespondToAuthChallengeRequest
+            {
+                ChallengeName = challenge.ChallengeName,
+                ClientId = ClientID,
+                Session = challenge.Session,
+                ChallengeResponses = challengeResponses
+            };
         }
     }
 }
